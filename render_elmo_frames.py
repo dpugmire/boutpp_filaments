@@ -69,6 +69,19 @@ def main() -> None:
         "(default: 0.50)",
     )
     parser.add_argument(
+        "--iso-range",
+        type=int,
+        nargs=2,
+        metavar=("START", "STOP"),
+        help="Inclusive timestep range used for the iso-fraction pressure min/max",
+    )
+    parser.add_argument(
+        "--trailing-steps",
+        type=int,
+        default=10,
+        help="Final timesteps to skip when --stop is omitted (default: 10)",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace frames that already exist",
@@ -82,6 +95,8 @@ def main() -> None:
         step_stop=args.stop,
         step_stride=args.stride,
         iso_fraction=args.iso_fraction,
+        iso_range=None if args.iso_range is None else tuple(args.iso_range),
+        trailing_steps=args.trailing_steps,
         overwrite=args.overwrite,
         grid_output=args.grid_output,
         write_grid_vtk=args.write_grid_vtk,

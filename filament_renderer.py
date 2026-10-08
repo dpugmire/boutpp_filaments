@@ -987,6 +987,23 @@ def _automatic_color_limits(
     return minimum, maximum
 
 
+def _pressure_range(pressure: np.ndarray) -> tuple[float, float]:
+    return float(np.nanmin(pressure)), float(np.nanmax(pressure))
+
+
+def _pressure_range_over_steps(
+    data: _RunData, start: int, stop: int, color_field: str
+) -> tuple[float, float]:
+    minimum = np.inf
+    maximum = -np.inf
+    for step in range(start, stop + 1):
+        pressure, _, _, _ = data.read_step(step, color_field)
+        step_min, step_max = _pressure_range(pressure)
+        minimum = min(minimum, step_min)
+        maximum = max(maximum, step_max)
+    return float(minimum), float(maximum)
+
+
 def _render_frame(
     data: _RunData,
     background: pv.DataSet,
@@ -1134,6 +1151,8 @@ def render_filaments(
     step_stride: int = 10,
     iso_fraction: float | None = 0.50,
     iso_value: float | None = None,
+    iso_range: tuple[int, int] | None = None,
+    trailing_steps: int = 10,
     color_field: str = "phi",
     color_percentile: float = 98.0,
     color_limits: tuple[float, float] | None = None,
@@ -1165,6 +1184,12 @@ def render_filaments(
     iso_value
         Absolute pressure-isosurface value.  Set this instead of
         ``iso_fraction`` to keep the level fixed across timesteps.
+    iso_range
+        Optional inclusive timestep range used to compute one pressure range
+        for all isofraction levels.  If omitted, the pressure range is
+        computed independently for each timestep.
+    trailing_steps
+        Number of final timesteps to omit when ``step_stop`` is None.
     color_field
         ADIOS variable used to color the opaque half-torus mesh.
     color_percentile
@@ -1200,6 +1225,8 @@ def render_filaments(
         raise ValueError("step_start must be non-negative")
     if step_stride <= 0:
         raise ValueError("step_stride must be positive")
+    if trailing_steps < 0:
+        raise ValueError("trailing_steps must be non-negative")
     if (iso_fraction is None) == (iso_value is None):
         raise ValueError("Set exactly one of iso_fraction or iso_value")
     if iso_fraction is not None and not 0.0 < iso_fraction <= 1.0:
@@ -1210,6 +1237,9 @@ def render_filaments(
         raise ValueError("color_limits must be increasing")
     if len(window_size) != 2 or min(window_size) <= 0:
         raise ValueError("window_size must contain two positive integers")
+    if iso_range is not None:
+        if len(iso_range) != 2 or iso_range[0] < 0 or iso_range[0] > iso_range[1]:
+            raise ValueError("iso_range must contain two ordered non-negative indices")
 
     runs = _normalize_inputs(input_dirs)
     output_dir = Path(output_dir).expanduser().resolve()
@@ -1248,12 +1278,28 @@ def render_filaments(
             if grid_output is not None
             else run_output / "background.vtk"
         )
-        stop = data.nsteps if step_stop is None else min(step_stop, data.nsteps)
+        stop = (
+            max(step_start, data.nsteps - trailing_steps)
+            if step_stop is None
+            else min(step_stop, data.nsteps)
+        )
         if step_start >= stop:
             data.close()
             raise ValueError(
                 f"Empty timestep range for {run_name}: "
                 f"start={step_start}, stop={stop}, available={data.nsteps}"
+            )
+
+        fixed_pressure_range = None
+        if iso_range is not None:
+            range_start, range_stop = iso_range
+            if range_stop >= data.nsteps:
+                raise ValueError(
+                    f"iso_range stop must be less than available steps "
+                    f"({data.nsteps}), got {range_stop}"
+                )
+            fixed_pressure_range = _pressure_range_over_steps(
+                data, range_start, range_stop, color_field
             )
 
         plotter = pv.Plotter(off_screen=True, window_size=window_size)
@@ -1308,11 +1354,16 @@ def render_filaments(
                         output_path = run_output / filename
                         row["filename"] = str(output_path)
 
-                    pressure_max = float(np.nanmax(pressure))
+                    pressure_min, pressure_max = (
+                        fixed_pressure_range
+                        if fixed_pressure_range is not None
+                        else _pressure_range(pressure)
+                    )
                     level = (
                         float(iso_value)
                         if iso_value is not None
-                        else float(iso_fraction) * pressure_max
+                        else pressure_min
+                        + float(iso_fraction) * (pressure_max - pressure_min)
                     )
                     if level <= 0.0:
                         raise ValueError(
@@ -1360,7 +1411,7 @@ def render_filaments(
                             "" if simulation_time is None else simulation_time
                         ),
                         iso_level=level,
-                        P_min=float(np.nanmin(pressure)),
+                        P_min=pressure_min,
                         P_max=pressure_max,
                         heatflux_par_e_min=float(np.nanmin(heatflux)),
                         heatflux_par_e_max=float(np.nanmax(heatflux)),
@@ -1429,6 +1480,19 @@ def _main() -> None:
     parser.add_argument("--stride", type=int, default=10)
     parser.add_argument("--iso-fraction", type=float, default=0.50)
     parser.add_argument("--iso-value", type=float)
+    parser.add_argument(
+        "--iso-range",
+        type=int,
+        nargs=2,
+        metavar=("START", "STOP"),
+        help="Inclusive timestep range used for the iso-fraction pressure min/max",
+    )
+    parser.add_argument(
+        "--trailing-steps",
+        type=int,
+        default=10,
+        help="Final timesteps to skip when --stop is omitted (default: 10)",
+    )
     parser.add_argument("--color-field", default="phi")
     parser.add_argument(
         "--write-grid-vtk",
@@ -1454,6 +1518,8 @@ def _main() -> None:
         step_stride=args.stride,
         iso_fraction=iso_fraction,
         iso_value=args.iso_value,
+        iso_range=None if args.iso_range is None else tuple(args.iso_range),
+        trailing_steps=args.trailing_steps,
         color_field=args.color_field,
         write_grid_vtk=args.write_grid_vtk,
         write_merged_grid_vtk=args.write_merged_grid_vtk,
