@@ -33,6 +33,7 @@ VISIT_FULL_K = np.arange(VISIT_NZ_OUT + 1, dtype=int)
 VISIT_HALF_K = np.arange(VISIT_NZ_OUT // 2 + 1, dtype=int)
 VISIT_HALF_PHI = VISIT_HALF_K * (2.0 * np.pi / VISIT_NZ_OUT)
 VISIT_REPLICATION_ANGLE = np.pi / 24.0
+GRID_MERGE_TOLERANCE = 1.0e-12
 CAMERA_PARALLEL_SCALE_FACTOR = 0.82
 
 
@@ -847,29 +848,58 @@ def _make_sector_grid(
     return grid
 
 
-def _write_boutpp_grid(
+def _write_boutpp_grids(
     data: _RunData,
-    output_path: Path,
+    multiblock_output: Path | None,
+    merged_output: Path | None,
     overwrite: bool,
     field_values: np.ndarray | None = None,
     field_name: str = "",
-) -> Path:
-    if output_path.exists() and not overwrite:
-        print(f"  grid exists, skipping {output_path}", flush=True)
-        return output_path
+) -> list[Path]:
+    pending_outputs = []
+    for output_path, description in (
+        (multiblock_output, "BOUT++ grid"),
+        (merged_output, "merged BOUT++ grid"),
+    ):
+        if output_path is None:
+            continue
+        if output_path.exists() and not overwrite:
+            print(f"  {description} exists, skipping {output_path}", flush=True)
+        else:
+            pending_outputs.append((output_path, description))
+
+    if not pending_outputs:
+        return []
 
     blocks = pv.MultiBlock()
     for mapping in data.visit_mappings:
         blocks[mapping["name"]] = _make_visit_grid(
             data, mapping, field_values, field_name
         )
-    blocks.save(output_path)
-    print(
-        f"  saved BOUT++ grid {output_path} "
-        f"({len(blocks)} VisIt-compatible subgrids)",
-        flush=True,
-    )
-    return output_path
+
+    written = []
+    for output_path, description in pending_outputs:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if output_path == merged_output:
+            merged = blocks.combine(
+                merge_points=True, tolerance=GRID_MERGE_TOLERANCE
+            )
+            merged.save(output_path)
+            print(
+                f"  saved {description} {output_path} "
+                f"({merged.n_points} points, {merged.n_cells} cells)",
+                flush=True,
+            )
+            del merged
+        else:
+            blocks.save(output_path)
+            print(
+                f"  saved {description} {output_path} "
+                f"({len(blocks)} VisIt-compatible subgrids)",
+                flush=True,
+            )
+        written.append(output_path)
+    return written
 
 
 def _build_filament_mesh(
@@ -1109,6 +1139,7 @@ def render_filaments(
     color_limits: tuple[float, float] | None = None,
     filename_pattern: str = "filament.{step:05d}.png",
     write_grid_vtk: bool = False,
+    write_merged_grid_vtk: bool = False,
     overwrite: bool = False,
     continue_on_error: bool = True,
     window_size: tuple[int, int] = (1200, 700),
@@ -1145,6 +1176,9 @@ def render_filaments(
     write_grid_vtk
         Write the seven VisIt-compatible BOUT++ structured subgrids to
         ``boutpp-grid.vtm`` below each run's output directory.
+    write_merged_grid_vtk
+        Write the same grid as one point-welded VTK unstructured grid to
+        ``boutpp-grid.vtu`` below each run's output directory.
     overwrite
         Replace existing images when true.  Existing images are otherwise
         treated as completed frames.
@@ -1188,11 +1222,16 @@ def render_filaments(
         run_output = output_dir / run_name
         run_output.mkdir(parents=True, exist_ok=True)
         try:
-            if write_grid_vtk:
+            if write_grid_vtk or write_merged_grid_vtk:
                 _, grid_field, _, _ = data.read_step(step_start, color_field)
-                _write_boutpp_grid(
+                _write_boutpp_grids(
                     data,
-                    run_output / "boutpp-grid.vtm",
+                    run_output / "boutpp-grid.vtm" if write_grid_vtk else None,
+                    (
+                        run_output / "boutpp-grid.vtu"
+                        if write_merged_grid_vtk
+                        else None
+                    ),
                     overwrite,
                     field_values=grid_field,
                     field_name=color_field,
@@ -1396,6 +1435,11 @@ def _main() -> None:
         action="store_true",
         help="Write the VisIt-compatible BOUT++ grid to boutpp-grid.vtm",
     )
+    parser.add_argument(
+        "--write-merged-grid-vtk",
+        action="store_true",
+        help="Write one point-welded BOUT++ grid to boutpp-grid.vtu",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
@@ -1412,6 +1456,7 @@ def _main() -> None:
         iso_value=args.iso_value,
         color_field=args.color_field,
         write_grid_vtk=args.write_grid_vtk,
+        write_merged_grid_vtk=args.write_merged_grid_vtk,
         overwrite=args.overwrite,
         continue_on_error=not args.fail_fast,
     )

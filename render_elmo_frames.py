@@ -39,6 +39,11 @@ def main() -> None:
         help="Write the complete VisIt-compatible BOUT++ grid as boutpp-grid.vtm",
     )
     parser.add_argument(
+        "--write-merged-grid-vtk",
+        action="store_true",
+        help="Write one point-welded BOUT++ grid as boutpp-grid.vtu",
+    )
+    parser.add_argument(
         "--start",
         type=int,
         default=0,
@@ -80,6 +85,7 @@ def main() -> None:
         overwrite=args.overwrite,
         grid_output=args.grid_output,
         write_grid_vtk=args.write_grid_vtk,
+        write_merged_grid_vtk=args.write_merged_grid_vtk,
     )
 
 
