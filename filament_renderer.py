@@ -1,6 +1,6 @@
 """Batch rendering for ELMO/BOUT++ filament visualizations.
 
-The mesh construction follows VisIt's BOUT++ NETCDF reader for a two-X-point
+The mesh construction follows VisIt's BOUT++ grid reader for a two-X-point
 topology.  Each image contains one opaque, half-torus background mesh and one
 opaque, full-torus pressure-isosurface mesh.
 
@@ -24,15 +24,16 @@ os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 import adios2
 import numpy as np
 import pyvista as pv
-from scipy.io import netcdf_file
 
 
 PRESSURE_HEATMAP = "RdBu_r"
 FILAMENT_COLOR = "#9f1d20"
 VISIT_NZ_OUT = 180
+VISIT_FULL_K = np.arange(VISIT_NZ_OUT + 1, dtype=int)
 VISIT_HALF_K = np.arange(VISIT_NZ_OUT // 2 + 1, dtype=int)
 VISIT_HALF_PHI = VISIT_HALF_K * (2.0 * np.pi / VISIT_NZ_OUT)
 VISIT_REPLICATION_ANGLE = np.pi / 24.0
+CAMERA_PARALLEL_SCALE_FACTOR = 0.82
 
 
 @dataclass
@@ -40,6 +41,7 @@ class _RunData:
     run_dir: Path
     bp_path: Path
     grid_path: Path
+    bp_reader: object
     available: dict
     nsteps: int
     nx: int
@@ -73,15 +75,20 @@ class _RunData:
     bout_blocks: list
     visit_mappings: list
 
+    def close(self) -> None:
+        if self.bp_reader is not None:
+            self.bp_reader.close()
+            self.bp_reader = None
+
     @classmethod
     def load(cls, run_dir: Path) -> "_RunData":
         run_dir = Path(run_dir).expanduser().resolve()
         bp_path = run_dir / "BOUT.dmp.bp"
-        grid_path = run_dir / "grid.nc"
+        grid_path = run_dir / "grid.bp"
         if not bp_path.exists():
             raise FileNotFoundError(f"ADIOS output not found: {bp_path}")
-        if not grid_path.is_file():
-            raise FileNotFoundError(f"BOUT++ grid not found: {grid_path}")
+        if not grid_path.exists():
+            raise FileNotFoundError(f"ADIOS BOUT++ grid not found: {grid_path}")
 
         required = [
             "P",
@@ -99,47 +106,45 @@ class _RunData:
             "jyseps2_2",
             "ny_inner",
         ]
-        with adios2.FileReader(str(bp_path)) as bp:
-            available = bp.available_variables()
-            missing = [name for name in required if name not in available]
-            if missing:
-                raise KeyError(f"Missing ADIOS variables in {bp_path}: {missing}")
+        bp = adios2.FileReader(str(bp_path))
+        available = bp.available_variables()
+        missing = [name for name in required if name not in available]
+        if missing:
+            bp.close()
+            raise KeyError(f"Missing ADIOS variables in {bp_path}: {missing}")
 
-            nsteps = int(available["P"]["AvailableStepsCount"])
-            p_shape = tuple(
-                int(value)
-                for value in re.findall(r"\d+", available["P"]["Shape"])
-            )
-            if len(p_shape) != 3:
-                raise ValueError(f"Expected a 3-D P shape, got {p_shape}")
+        nsteps = int(available["P"]["AvailableStepsCount"])
+        p_shape = tuple(
+            int(value) for value in re.findall(r"\d+", available["P"]["Shape"])
+        )
+        if len(p_shape) != 3:
+            raise ValueError(f"Expected a 3-D P shape, got {p_shape}")
 
-            dy_raw = np.asarray(bp.read("dy"), dtype=np.float64).squeeze()
-            g22_raw = np.asarray(bp.read("g_22"), dtype=np.float64).squeeze()
-            diffusion = float(np.asarray(bp.read("diffusion_par")).squeeze())
-            ny_model = int(np.asarray(bp.read("ny")).squeeze())
-            myg = int(np.asarray(bp.read("MYG")).squeeze())
-            zperiod = int(np.asarray(bp.read("zperiod")).squeeze())
-            ixseps1 = int(np.asarray(bp.read("ixseps1")).squeeze())
-            ixseps2 = int(np.asarray(bp.read("ixseps2")).squeeze())
-            jyseps1_1 = int(np.asarray(bp.read("jyseps1_1")).squeeze())
-            jyseps1_2 = int(np.asarray(bp.read("jyseps1_2")).squeeze())
-            jyseps2_1 = int(np.asarray(bp.read("jyseps2_1")).squeeze())
-            jyseps2_2 = int(np.asarray(bp.read("jyseps2_2")).squeeze())
-            ny_inner = int(np.asarray(bp.read("ny_inner")).squeeze())
+        dy_raw = np.asarray(bp.read("dy"), dtype=np.float64).squeeze()
+        g22_raw = np.asarray(bp.read("g_22"), dtype=np.float64).squeeze()
+        diffusion = float(np.asarray(bp.read("diffusion_par")).squeeze())
+        ny_model = int(np.asarray(bp.read("ny")).squeeze())
+        myg = int(np.asarray(bp.read("MYG")).squeeze())
+        zperiod = int(np.asarray(bp.read("zperiod")).squeeze())
+        ixseps1 = int(np.asarray(bp.read("ixseps1")).squeeze())
+        ixseps2 = int(np.asarray(bp.read("ixseps2")).squeeze())
+        jyseps1_1 = int(np.asarray(bp.read("jyseps1_1")).squeeze())
+        jyseps1_2 = int(np.asarray(bp.read("jyseps1_2")).squeeze())
+        jyseps2_1 = int(np.asarray(bp.read("jyseps2_1")).squeeze())
+        jyseps2_2 = int(np.asarray(bp.read("jyseps2_2")).squeeze())
+        ny_inner = int(np.asarray(bp.read("ny_inner")).squeeze())
 
-        with netcdf_file(str(grid_path), "r", mmap=False) as grid:
-            grid_variables = grid.variables
+        with adios2.FileReader(str(grid_path)) as grid:
+            grid_variables = grid.available_variables()
             grid_required = ["Rxy", "Zxy", "zShift", "ShiftAngle"]
             missing = [name for name in grid_required if name not in grid_variables]
             if missing:
                 raise KeyError(f"Missing grid variables in {grid_path}: {missing}")
-            rxy = np.array(grid_variables["Rxy"][:], dtype=np.float64, copy=True)
-            zxy = np.array(grid_variables["Zxy"][:], dtype=np.float64, copy=True)
-            zshift = np.array(
-                grid_variables["zShift"][:], dtype=np.float64, copy=True
-            )
-            shift_angle = np.array(
-                grid_variables["ShiftAngle"][:], dtype=np.float64, copy=True
+            rxy = np.asarray(grid.read("Rxy"), dtype=np.float64).copy()
+            zxy = np.asarray(grid.read("Zxy"), dtype=np.float64).copy()
+            zshift = np.asarray(grid.read("zShift"), dtype=np.float64).copy()
+            shift_angle = np.asarray(
+                grid.read("ShiftAngle"), dtype=np.float64
             ).squeeze()
 
         nx, ny = zshift.shape
@@ -216,6 +221,7 @@ class _RunData:
             run_dir=run_dir,
             bp_path=bp_path,
             grid_path=grid_path,
+            bp_reader=bp,
             available=available,
             nsteps=nsteps,
             nx=nx,
@@ -284,18 +290,18 @@ class _RunData:
         if color_field not in self.available:
             raise KeyError(f"ADIOS variable not found: {color_field}")
 
-        with adios2.FileReader(str(self.bp_path)) as bp:
-            pressure = _read_adios_variable(bp, self.available, "P", step)
-            color = _read_adios_variable(
-                bp, self.available, color_field, step, allow_static=True
+        bp = self.bp_reader
+        pressure = _read_adios_variable(bp, self.available, "P", step)
+        color = _read_adios_variable(
+            bp, self.available, color_field, step, allow_static=True
+        )
+        if "t_array" in self.available:
+            time_values = _read_adios_variable(
+                bp, self.available, "t_array", step, allow_static=True
             )
-            if "t" in self.available:
-                time_values = _read_adios_variable(
-                    bp, self.available, "t", step, allow_static=True
-                )
-                simulation_time = float(np.asarray(time_values).reshape(-1)[0])
-            else:
-                simulation_time = None
+            simulation_time = float(np.asarray(time_values).reshape(-1)[0])
+        else:
+            simulation_time = None
 
         pressure = self._physical_field(pressure, "P")
         color = self._physical_field(color, color_field)
@@ -361,6 +367,32 @@ def _read_adios_variable(
         if len(declared_shape) + 1 == values.ndim:
             values = values[0]
     return values
+
+
+def get_simulation_time(run_dir: str | Path, step: int) -> float:
+    """Return the simulation time stored in an ELMO timestep."""
+    run_dir = Path(run_dir).expanduser().resolve()
+    bp_path = run_dir / "BOUT.dmp.bp"
+    if not bp_path.exists():
+        raise FileNotFoundError(f"ADIOS output not found: {bp_path}")
+
+    with adios2.FileReader(str(bp_path)) as bp:
+        available = bp.available_variables()
+        if "t_array" not in available:
+            raise KeyError(f"Time variable 't_array' not found in {bp_path}")
+        step_count = int(available["t_array"].get("AvailableStepsCount", "1"))
+        if not 0 <= step < step_count:
+            raise IndexError(
+                f"step={step} is outside the available range 0:{step_count - 1}"
+            )
+        values = _read_adios_variable(
+            bp, available, "t_array", step, allow_static=True
+        )
+
+    values = np.asarray(values).reshape(-1)
+    if values.size != 1:
+        raise ValueError(f"Expected scalar time at step {step}, got {values.shape}")
+    return float(values[0])
 
 
 def _make_parallel_topology(
@@ -647,7 +679,10 @@ def _make_visit_mappings(data: _RunData) -> list[dict]:
 
 
 def _visit_interpolate_field(
-    data: _RunData, mapping: dict, field_values: np.ndarray
+    data: _RunData,
+    mapping: dict,
+    field_values: np.ndarray,
+    plane_indices: np.ndarray = VISIT_HALF_K,
 ) -> np.ndarray:
     values = np.asarray(field_values)
     indices = mapping["indices"]
@@ -657,18 +692,18 @@ def _visit_interpolate_field(
         flat = values.reshape(-1)
         spatial = np.sum(weights * flat[indices], axis=0).astype(np.float32)
         return np.broadcast_to(
-            spatial[..., None], spatial.shape + (len(VISIT_HALF_K),)
+            spatial[..., None], spatial.shape + (len(plane_indices),)
         )
     if values.ndim != 3:
         raise ValueError(f"Expected a 2-D or 3-D nodal field, got {values.shape}")
 
     source_nz = values.shape[2]
     flat = values.reshape(data.nx * data.ny, source_nz)
-    result = np.empty(mapping["shape"] + (len(VISIT_HALF_K),), dtype=np.float32)
+    result = np.empty(mapping["shape"] + (len(plane_indices),), dtype=np.float32)
     z_period = 2.0 * np.pi / data.zperiod
     source_spacing = z_period / source_nz
 
-    for plane, k in enumerate(VISIT_HALF_K):
+    for plane, k in enumerate(plane_indices):
         z_angle = k * 2.0 * np.pi / VISIT_NZ_OUT
         angle = np.mod(z_angle - mapping["shift"], z_period)
         source_coordinate = angle / source_spacing
@@ -757,11 +792,8 @@ def _merge_meshes(meshes: list[pv.DataSet]) -> pv.DataSet:
     return merged
 
 
-def _make_sector_grid(
-    data: _RunData,
-    pressure: np.ndarray,
-    ix: np.ndarray,
-    jy: np.ndarray,
+def _make_sector_grid_geometry(
+    data: _RunData, ix: np.ndarray, jy: np.ndarray
 ) -> pv.StructuredGrid:
     ix = np.asarray(ix, dtype=int)
     jy = np.asarray(jy, dtype=int)
@@ -774,14 +806,70 @@ def _make_sector_grid(
     x = radius[..., None] * np.cos(theta)
     y = np.broadcast_to(vertical[..., None], theta.shape)
     z = radius[..., None] * np.sin(theta)
+    return pv.StructuredGrid(x, y, z)
+
+
+def _make_visit_grid(
+    data: _RunData,
+    mapping: dict,
+    field_values: np.ndarray | None = None,
+    field_name: str = "",
+) -> pv.StructuredGrid:
+    radius = mapping["radius"][..., None]
+    vertical = mapping["vertical"][..., None]
+    phi = VISIT_FULL_K * (2.0 * np.pi / VISIT_NZ_OUT)
+    x = radius * np.cos(phi)[None, None, :]
+    y = np.broadcast_to(vertical, x.shape)
+    z = radius * np.sin(phi)[None, None, :]
+    grid = pv.StructuredGrid(x, y, z)
+
+    if field_values is not None:
+        values = _visit_interpolate_field(
+            data, mapping, field_values, VISIT_FULL_K
+        )
+        grid.point_data[field_name] = values.ravel(order="F")
+    return grid
+
+
+def _make_sector_grid(
+    data: _RunData,
+    pressure: np.ndarray,
+    ix: np.ndarray,
+    jy: np.ndarray,
+) -> pv.StructuredGrid:
+    grid = _make_sector_grid_geometry(data, ix, jy)
 
     pressure_values = pressure[np.ix_(ix, jy, np.arange(data.nz, dtype=int))]
     pressure_values = np.concatenate(
         (pressure_values, pressure_values[..., :1]), axis=2
     )
-    grid = pv.StructuredGrid(x, y, z)
     grid.point_data["P"] = pressure_values.ravel(order="F")
     return grid
+
+
+def _write_boutpp_grid(
+    data: _RunData,
+    output_path: Path,
+    overwrite: bool,
+    field_values: np.ndarray | None = None,
+    field_name: str = "",
+) -> Path:
+    if output_path.exists() and not overwrite:
+        print(f"  grid exists, skipping {output_path}", flush=True)
+        return output_path
+
+    blocks = pv.MultiBlock()
+    for mapping in data.visit_mappings:
+        blocks[mapping["name"]] = _make_visit_grid(
+            data, mapping, field_values, field_name
+        )
+    blocks.save(output_path)
+    print(
+        f"  saved BOUT++ grid {output_path} "
+        f"({len(blocks)} VisIt-compatible subgrids)",
+        flush=True,
+    )
+    return output_path
 
 
 def _build_filament_mesh(
@@ -819,6 +907,37 @@ def _build_background_mesh(
     return _merge_meshes(faces)
 
 
+def _background_scalars(
+    data: _RunData, field_values: np.ndarray
+) -> np.ndarray:
+    values = []
+    for mapping in data.visit_mappings:
+        interpolated = _visit_interpolate_field(data, mapping, field_values)
+        for plane in (0, len(VISIT_HALF_PHI) - 1):
+            values.append(interpolated[..., plane].T.ravel(order="F"))
+        for j in (0, interpolated.shape[1] - 1):
+            values.append(interpolated[:, j, :])
+            values[-1] = values[-1].ravel(order="F")
+        for i in (0, interpolated.shape[0] - 1):
+            values.append(interpolated[i, :, :].ravel(order="F"))
+    return np.concatenate(values).astype(np.float32, copy=False)
+
+
+def _update_background_scalars(
+    data: _RunData,
+    background: pv.DataSet,
+    field_values: np.ndarray,
+    field_name: str,
+) -> None:
+    scalars = _background_scalars(data, field_values)
+    if len(scalars) != background.n_points:
+        raise ValueError(
+            f"Background scalar count {len(scalars)} does not match "
+            f"mesh points {background.n_points}"
+        )
+    background.point_data[field_name] = scalars
+
+
 def _automatic_color_limits(
     field_values: np.ndarray, field_name: str, percentile: float
 ) -> tuple[float, float]:
@@ -840,67 +959,86 @@ def _automatic_color_limits(
 
 def _render_frame(
     data: _RunData,
+    background: pv.DataSet,
     pressure: np.ndarray,
     color_values: np.ndarray,
     color_field: str,
     iso_level: float,
+    simulation_time: float | None,
     output_path: Path,
     color_limits: tuple[float, float],
     window_size: tuple[int, int],
-) -> tuple[int, int]:
-    background = _build_background_mesh(data, color_values, color_field)
+    plotter: pv.Plotter,
+    background_actor: object | None,
+    filament_actor: object | None,
+) -> tuple[int, int, object, object]:
     filaments = _build_filament_mesh(data, pressure, iso_level)
 
-    plotter = pv.Plotter(off_screen=True, window_size=window_size)
-    plotter.set_background("white")
-    plotter.add_mesh(
-        background,
-        scalars=color_field,
-        preference="point",
-        cmap=PRESSURE_HEATMAP,
-        clim=color_limits,
-        opacity=1.0,
-        show_edges=False,
-        smooth_shading=True,
-        lighting=True,
-        interpolate_before_map=True,
-        show_scalar_bar=True,
-        scalar_bar_args=dict(
-            title=color_field,
-            vertical=True,
-            position_x=0.88,
-            position_y=0.12,
-            height=0.76,
-            width=0.025,
-            color="black",
-            fmt="%.1e",
-        ),
-    )
-    plotter.add_mesh(
-        filaments,
-        color=FILAMENT_COLOR,
-        opacity=1.0,
-        show_edges=False,
-        smooth_shading=True,
-        lighting=True,
-        show_scalar_bar=False,
-    )
-
-    mesh_radius = float(np.nanmax(np.abs(data.rxy)))
-    vertical_span = float(np.nanmax(data.zxy) - np.nanmin(data.zxy))
-    plotter.enable_parallel_projection()
-    plotter.camera_position = [
-        (5.0, 1.8, -9.060019493103027),
-        (0.0, -0.017590701580047607, 0.0),
-        (0.0, 1.0, 0.0),
-    ]
-    plotter.camera.parallel_scale = 1.08 * max(mesh_radius, 0.5 * vertical_span)
-    plotter.enable_anti_aliasing("ssaa")
-    plotter.show(screenshot=str(output_path), auto_close=True)
+    if filament_actor is None:
+        plotter.set_background("white")
+        background_actor = plotter.add_mesh(
+            background,
+            scalars=color_field,
+            preference="point",
+            cmap=PRESSURE_HEATMAP,
+            clim=color_limits,
+            opacity=1.0,
+            show_edges=False,
+            smooth_shading=True,
+            lighting=True,
+            interpolate_before_map=True,
+            show_scalar_bar=True,
+            scalar_bar_args=dict(
+                title=color_field,
+                vertical=True,
+                position_x=0.88,
+                position_y=0.12,
+                height=0.76,
+                width=0.025,
+                color="black",
+                fmt="%.1e",
+            ),
+        )
+        filament_actor = plotter.add_mesh(
+            filaments,
+            color=FILAMENT_COLOR,
+            opacity=1.0,
+            show_edges=False,
+            smooth_shading=True,
+            lighting=True,
+            show_scalar_bar=False,
+        )
+        mesh_radius = float(np.nanmax(np.abs(data.rxy)))
+        vertical_span = float(np.nanmax(data.zxy) - np.nanmin(data.zxy))
+        plotter.enable_parallel_projection()
+        plotter.camera_position = [
+            (5.0, 1.8, -9.060019493103027),
+            (0.0, -0.017590701580047607, 0.0),
+            (0.0, 1.0, 0.0),
+        ]
+        plotter.camera.parallel_scale = CAMERA_PARALLEL_SCALE_FACTOR * max(
+            mesh_radius, 0.5 * vertical_span
+        )
+    else:
+        background_actor.mapper.scalar_range = color_limits
+        background_actor.mapper.Modified()
+        filament_actor.mapper.SetInputData(filaments)
+        filament_actor.mapper.Modified()
+    if simulation_time is not None:
+        if hasattr(plotter, "_time_text_actor"):
+            plotter._time_text_actor.SetText(2, f"t = {simulation_time:08.2f}")
+        else:
+            plotter._time_text_actor = plotter.add_text(
+                f"t = {simulation_time:08.2f}",
+                position="upper_left",
+                font_size=18,
+                color="black",
+            )
+    plotter.show(screenshot=str(output_path), auto_close=False)
     counts = (int(background.n_cells), int(filaments.n_cells))
-    del background, filaments, plotter
+    del filaments
     gc.collect()
-    return counts
+    return (*counts, background_actor, filament_actor)
 
 
 def _normalize_inputs(
@@ -970,9 +1108,11 @@ def render_filaments(
     color_percentile: float = 98.0,
     color_limits: tuple[float, float] | None = None,
     filename_pattern: str = "filament.{step:05d}.png",
+    write_grid_vtk: bool = False,
     overwrite: bool = False,
     continue_on_error: bool = True,
-    window_size: tuple[int, int] = (1800, 1050),
+    window_size: tuple[int, int] = (1200, 700),
+    grid_output: str | Path | None = None,
 ) -> dict[str, list[Path]]:
     """Render filament images for one or more ELMO ADIOS runs.
 
@@ -981,7 +1121,7 @@ def render_filaments(
     input_dirs
         One run directory, a sequence of run directories, or a mapping from
         short run names to directories.  A mapping is recommended for multiple
-        runs.  Each directory must contain ``BOUT.dmp.bp`` and ``grid.nc``.
+        runs.  Each directory must contain ``BOUT.dmp.bp`` and ``grid.bp``.
     output_dir
         Parent output directory.  Images are written below one subdirectory per
         run, for example ``output_dir/run5/filament.00500.png``.
@@ -1002,11 +1142,19 @@ def render_filaments(
         Optional fixed ``(minimum, maximum)`` color range.
     filename_pattern
         ``str.format`` pattern receiving ``run``, ``step``, and ``time``.
+    write_grid_vtk
+        Write the seven VisIt-compatible BOUT++ structured subgrids to
+        ``boutpp-grid.vtm`` below each run's output directory.
     overwrite
         Replace existing images when true.  Existing images are otherwise
         treated as completed frames.
     continue_on_error
         Record a failed frame in ``manifest.csv`` and continue when true.
+    grid_output
+        Optional VTK output path for the generated background visualization
+        mesh.  The mesh is exported once per run after the first successful
+        timestep; if omitted, it is written as ``background.vtk`` below the
+        run output directory.
 
     Returns
     -------
@@ -1039,16 +1187,39 @@ def render_filaments(
         data = _RunData.load(run_dir)
         run_output = output_dir / run_name
         run_output.mkdir(parents=True, exist_ok=True)
+        try:
+            if write_grid_vtk:
+                _, grid_field, _, _ = data.read_step(step_start, color_field)
+                _write_boutpp_grid(
+                    data,
+                    run_output / "boutpp-grid.vtm",
+                    overwrite,
+                    field_values=grid_field,
+                    field_name=color_field,
+                )
+        except Exception:
+            data.close()
+            raise
         manifest_path = run_output / "manifest.csv"
         rows = []
         images = []
-
+        background_mesh = None
+        background_output = (
+            Path(grid_output).expanduser().resolve()
+            if grid_output is not None
+            else run_output / "background.vtk"
+        )
         stop = data.nsteps if step_stop is None else min(step_stop, data.nsteps)
         if step_start >= stop:
+            data.close()
             raise ValueError(
                 f"Empty timestep range for {run_name}: "
                 f"start={step_start}, stop={stop}, available={data.nsteps}"
             )
+
+        plotter = pv.Plotter(off_screen=True, window_size=window_size)
+        background_actor = None
+        filament_actor = None
 
         print(
             f"  {data.nsteps} available steps; rendering "
@@ -1111,15 +1282,39 @@ def render_filaments(
                     limits = color_limits or _automatic_color_limits(
                         color, color_field, color_percentile
                     )
-                    background_cells, filament_cells = _render_frame(
+                    if background_mesh is None:
+                        background_mesh = _build_background_mesh(
+                            data, color, color_field
+                        )
+                        background_output.parent.mkdir(parents=True, exist_ok=True)
+                        background_mesh.save(str(background_output))
+                        print(
+                            f"  saved background grid {background_output}",
+                            flush=True,
+                        )
+                    else:
+                        _update_background_scalars(
+                            data, background_mesh, color, color_field
+                        )
+                    (
+                        background_cells,
+                        filament_cells,
+                        background_actor,
+                        filament_actor,
+                    ) = _render_frame(
                         data,
+                        background_mesh,
                         pressure,
                         color,
                         color_field,
                         level,
+                        simulation_time,
                         output_path,
                         limits,
                         window_size,
+                        plotter,
+                        background_actor,
+                        filament_actor,
                     )
                     row.update(
                         simulation_time=(
@@ -1150,6 +1345,8 @@ def render_filaments(
                 if not continue_on_error:
                     rows.append(row)
                     _write_manifest(manifest_path, rows)
+                    plotter.close()
+                    data.close()
                     raise
             rows.append(row)
             _write_manifest(manifest_path, rows)
@@ -1163,6 +1360,8 @@ def render_filaments(
             f"failed={failed}; manifest={manifest_path}",
             flush=True,
         )
+        plotter.close()
+        data.close()
         del data
         gc.collect()
     return results
@@ -1192,6 +1391,11 @@ def _main() -> None:
     parser.add_argument("--iso-fraction", type=float, default=0.50)
     parser.add_argument("--iso-value", type=float)
     parser.add_argument("--color-field", default="phi")
+    parser.add_argument(
+        "--write-grid-vtk",
+        action="store_true",
+        help="Write the VisIt-compatible BOUT++ grid to boutpp-grid.vtm",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
@@ -1207,6 +1411,7 @@ def _main() -> None:
         iso_fraction=iso_fraction,
         iso_value=args.iso_value,
         color_field=args.color_field,
+        write_grid_vtk=args.write_grid_vtk,
         overwrite=args.overwrite,
         continue_on_error=not args.fail_fast,
     )
