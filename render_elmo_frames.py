@@ -53,7 +53,7 @@ def main() -> None:
         "--stop",
         type=int,
         default=None,
-        help="Exclusive timestep stop; defaults to all available timesteps",
+        help="Exclusive stop; if omitted, skips the final --trailing-steps (default: 10)",
     )
     parser.add_argument(
         "--stride",
@@ -61,13 +61,28 @@ def main() -> None:
         default=1,
         help="Timestep spacing (default: 1)",
     )
-    parser.add_argument(
+    thresholds = parser.add_mutually_exclusive_group()
+    thresholds.add_argument(
         "--iso-fraction",
         type=float,
         default=0.50,
-        help="Pressure isovalue as a fraction of max(P), from 0 to 1 "
-        "(default: 0.50)",
+        help="Pressure isovalue as a fraction of the range from min(P) to "
+        "max(P), from 0 to 1 (default: 0.50)",
     )
+    thresholds.add_argument("--iso-value", type=float, help="Absolute pressure threshold in code units")
+    thresholds.add_argument("--iso-kpa", type=float, help="Common absolute physical pressure threshold in kPa")
+    parser.add_argument(
+        "--pressure-quantity", choices=["P", "fluctuation", "total"], default="P",
+        help="Saved P, nonaxisymmetric P-mean_z(P), or P0+P (default: P)",
+    )
+    parser.add_argument("--grid-path", type=Path, help="Matching grid.bp path")
+    parser.add_argument(
+        "--grid-confirmed", action="store_true",
+        help="Use a confirmed original input grid after shape/topology checks; "
+        "record numerical comparisons separately",
+    )
+    parser.add_argument("--color-field", default="phi")
+    parser.add_argument("--color-limits", type=float, nargs=2, metavar=("MIN", "MAX"))
     parser.add_argument(
         "--iso-range",
         type=int,
@@ -94,7 +109,14 @@ def main() -> None:
         step_start=args.start,
         step_stop=args.stop,
         step_stride=args.stride,
-        iso_fraction=args.iso_fraction,
+        iso_fraction=None if args.iso_value is not None else args.iso_fraction,
+        iso_value=args.iso_value,
+        iso_kpa=args.iso_kpa,
+        pressure_quantity=args.pressure_quantity,
+        grid_path=args.grid_path,
+        grid_confirmed=args.grid_confirmed,
+        color_field=args.color_field,
+        color_limits=None if args.color_limits is None else tuple(args.color_limits),
         iso_range=None if args.iso_range is None else tuple(args.iso_range),
         trailing_steps=args.trailing_steps,
         overwrite=args.overwrite,

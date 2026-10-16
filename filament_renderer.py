@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gc
+import json
 import os
 import re
 import sys
@@ -25,9 +26,17 @@ import adios2
 import numpy as np
 import pyvista as pv
 
+from filament_diagnostics import (
+    DiagnosticRun,
+    physical_y_indices,
+    pressure_fluctuation,
+    pressure_scale,
+)
+
 
 PRESSURE_HEATMAP = "RdBu_r"
 FILAMENT_COLOR = "#9f1d20"
+HOLE_COLOR = "#2166ac"
 VISIT_NZ_OUT = 180
 VISIT_FULL_K = np.arange(VISIT_NZ_OUT + 1, dtype=int)
 VISIT_HALF_K = np.arange(VISIT_NZ_OUT // 2 + 1, dtype=int)
@@ -50,7 +59,7 @@ class _RunData:
     nz: int
     raw_ny: int
     myg: int
-    physical_y: slice
+    physical_y: np.ndarray
     diffusion: float
     zperiod: int
     ixseps1: int
@@ -82,10 +91,14 @@ class _RunData:
             self.bp_reader = None
 
     @classmethod
-    def load(cls, run_dir: Path) -> "_RunData":
+    def load(cls, run_dir: Path, grid_path: Path | None = None) -> "_RunData":
         run_dir = Path(run_dir).expanduser().resolve()
         bp_path = run_dir / "BOUT.dmp.bp"
-        grid_path = run_dir / "grid.bp"
+        grid_path = (
+            run_dir / "grid.bp"
+            if grid_path is None
+            else Path(grid_path).expanduser().resolve()
+        )
         if not bp_path.exists():
             raise FileNotFoundError(f"ADIOS output not found: {bp_path}")
         if not grid_path.exists():
@@ -150,7 +163,7 @@ class _RunData:
 
         nx, ny = zshift.shape
         raw_nx, raw_ny, nz = p_shape
-        physical_y = slice(myg, myg + ny)
+        physical_y, _ = physical_y_indices(raw_ny, ny, myg, ny_inner, g22_raw)
         dy = dy_raw[:, physical_y]
         g22 = g22_raw[:, physical_y]
 
@@ -288,14 +301,18 @@ class _RunData:
             raise IndexError(
                 f"step={step} is outside the available range 0:{self.nsteps - 1}"
             )
-        if color_field not in self.available:
+        derived_colors = {"p_fluct", "p_fluct_kpa", "p_total_kpa"}
+        if color_field not in self.available and color_field not in derived_colors:
             raise KeyError(f"ADIOS variable not found: {color_field}")
 
         bp = self.bp_reader
         pressure = _read_adios_variable(bp, self.available, "P", step)
-        color = _read_adios_variable(
-            bp, self.available, color_field, step, allow_static=True
-        )
+        if color_field in derived_colors:
+            color = None
+        else:
+            color = _read_adios_variable(
+                bp, self.available, color_field, step, allow_static=True
+            )
         if "t_array" in self.available:
             time_values = _read_adios_variable(
                 bp, self.available, "t_array", step, allow_static=True
@@ -305,7 +322,17 @@ class _RunData:
             simulation_time = None
 
         pressure = self._physical_field(pressure, "P")
-        color = self._physical_field(color, color_field)
+        if color_field in derived_colors:
+            if color_field == "p_total_kpa":
+                p0 = self._physical_field(np.asarray(bp.read("P0")), "P0")
+                color = pressure + p0[..., None]
+            else:
+                color = pressure_fluctuation(pressure)
+            if color_field.endswith("_kpa"):
+                bbar = float(np.asarray(bp.read("Bbar")).squeeze())
+                color = color * (pressure_scale(bbar) / 1000.0)
+        else:
+            color = self._physical_field(color, color_field)
         if pressure.shape != (self.nx, self.ny, self.nz):
             raise ValueError(
                 f"Expected P shape {(self.nx, self.ny, self.nz)}, "
@@ -671,10 +698,12 @@ def _build_visit_mapping(data: _RunData, grid: dict) -> dict:
     )
 
 
-def _make_visit_mappings(data: _RunData) -> list[dict]:
-    subgrids = [
-        _prepare_visit_subgrid(data, spec) for spec in _visit_subgrid_specs(data)
-    ]
+def _make_visit_mappings(data: _RunData, x_guard_cells: int = 0) -> list[dict]:
+    specs = _visit_subgrid_specs(data)
+    for spec in specs:
+        spec["istart"] = max(spec["istart"], x_guard_cells)
+        spec["iend"] = min(spec["iend"], data.nx - x_guard_cells)
+    subgrids = [_prepare_visit_subgrid(data, spec) for spec in specs]
     _match_xpoint_replication(data, subgrids)
     return [_build_visit_mapping(data, grid) for grid in subgrids]
 
@@ -903,8 +932,10 @@ def _write_boutpp_grids(
 
 
 def _build_filament_mesh(
-    data: _RunData, pressure: np.ndarray, level: float
+    data: _RunData, pressure: np.ndarray, level: float, *, allow_empty: bool = False
 ) -> pv.DataSet:
+    if allow_empty and not np.nanmin(pressure) <= level <= np.nanmax(pressure):
+        return pv.PolyData()
     sector_angle = 360.0 / data.zperiod
     surfaces = []
     for _, ix, jy in data.bout_blocks:
@@ -924,6 +955,8 @@ def _build_filament_mesh(
                         surfaces.append(rotated)
         del shifted
     if not surfaces:
+        if allow_empty:
+            return pv.PolyData()
         raise RuntimeError(f"No filament cells found at P={level:.12e}")
     return _merge_meshes(surfaces)
 
@@ -992,16 +1025,34 @@ def _pressure_range(pressure: np.ndarray) -> tuple[float, float]:
 
 
 def _pressure_range_over_steps(
-    data: _RunData, start: int, stop: int, color_field: str
+    data: _RunData, start: int, stop: int, color_field: str,
+    pressure_quantity: str = "P", p0: np.ndarray | None = None,
+    pressure_factor: float = 1.0,
+    valid_xy: np.ndarray | None = None,
 ) -> tuple[float, float]:
     minimum = np.inf
     maximum = -np.inf
     for step in range(start, stop + 1):
         pressure, _, _, _ = data.read_step(step, color_field)
-        step_min, step_max = _pressure_range(pressure)
+        pressure = _selected_pressure(pressure, pressure_quantity, p0, pressure_factor)
+        step_min, step_max = _pressure_range(
+            pressure if valid_xy is None else pressure[valid_xy]
+        )
         minimum = min(minimum, step_min)
         maximum = max(maximum, step_max)
     return float(minimum), float(maximum)
+
+
+def _selected_pressure(
+    pressure: np.ndarray, quantity: str, p0: np.ndarray | None, factor: float
+) -> np.ndarray:
+    if quantity == "fluctuation":
+        pressure = pressure_fluctuation(pressure)
+    elif quantity == "total":
+        if p0 is None:
+            raise ValueError("Total pressure requires P0")
+        pressure = pressure + p0[..., None]
+    return pressure * factor
 
 
 def _render_frame(
@@ -1018,10 +1069,20 @@ def _render_frame(
     plotter: pv.Plotter,
     background_actor: object | None,
     filament_actor: object | None,
-) -> tuple[int, int, object, object]:
-    filaments = _build_filament_mesh(data, pressure, iso_level)
+    hole_actor: object | None = None,
+    signed_surfaces: bool = False,
+    pressure_label: str = "P (code)",
+    time_scale: float | None = None,
+) -> tuple[int, int, int, object, object, object]:
+    filaments = _build_filament_mesh(
+        data, pressure, iso_level, allow_empty=signed_surfaces
+    )
+    holes = (
+        _build_filament_mesh(data, pressure, -iso_level, allow_empty=True)
+        if signed_surfaces else None
+    )
 
-    if filament_actor is None:
+    if background_actor is None:
         plotter.set_background("white")
         background_actor = plotter.add_mesh(
             background,
@@ -1046,15 +1107,6 @@ def _render_frame(
                 fmt="%.1e",
             ),
         )
-        filament_actor = plotter.add_mesh(
-            filaments,
-            color=FILAMENT_COLOR,
-            opacity=1.0,
-            show_edges=False,
-            smooth_shading=True,
-            lighting=True,
-            show_scalar_bar=False,
-        )
         mesh_radius = float(np.nanmax(np.abs(data.rxy)))
         vertical_span = float(np.nanmax(data.zxy) - np.nanmin(data.zxy))
         plotter.enable_parallel_projection()
@@ -1063,29 +1115,64 @@ def _render_frame(
             (0.0, -0.017590701580047607, 0.0),
             (0.0, 1.0, 0.0),
         ]
-        plotter.camera.parallel_scale = CAMERA_PARALLEL_SCALE_FACTOR * max(
-            mesh_radius, 0.5 * vertical_span
+        plotter.camera.parallel_scale = (
+            CAMERA_PARALLEL_SCALE_FACTOR * (1.25 if signed_surfaces else 1.0)
+            * max(mesh_radius, 0.5 * vertical_span)
         )
     else:
         background_actor.mapper.scalar_range = color_limits
         background_actor.mapper.Modified()
+
+    if filament_actor is None:
+        if filaments.n_cells:
+            filament_actor = plotter.add_mesh(
+                filaments, color=FILAMENT_COLOR, opacity=1.0,
+                show_edges=False, smooth_shading=True, lighting=True,
+                show_scalar_bar=False,
+            )
+    else:
         filament_actor.mapper.SetInputData(filaments)
         filament_actor.mapper.Modified()
+    if holes is not None:
+        if hole_actor is None:
+            if holes.n_cells:
+                hole_actor = plotter.add_mesh(
+                    holes, color=HOLE_COLOR, opacity=1.0,
+                    show_edges=False, smooth_shading=True, lighting=True,
+                    show_scalar_bar=False,
+                )
+        else:
+            hole_actor.mapper.SetInputData(holes)
+            hole_actor.mapper.Modified()
     if simulation_time is not None:
+        time_label = (
+            f"t = {simulation_time:08.2f}"
+            if time_scale is None
+            else f"t = {simulation_time * time_scale * 1.0e6:.2f} us"
+        )
         if hasattr(plotter, "_time_text_actor"):
-            plotter._time_text_actor.SetText(2, f"t = {simulation_time:08.2f}")
+            plotter._time_text_actor.SetText(2, time_label)
         else:
             plotter._time_text_actor = plotter.add_text(
-                f"t = {simulation_time:08.2f}",
+                time_label,
                 position="upper_left",
                 font_size=18,
                 color="black",
             )
+    if signed_surfaces:
+        plotter.add_text(
+            f"{pressure_label}: +{iso_level:g} (red), -{iso_level:g} (blue)",
+            position="lower_left", font_size=12, color="black",
+            name="pressure_threshold",
+        )
     plotter.show(screenshot=str(output_path), auto_close=False)
-    counts = (int(background.n_cells), int(filaments.n_cells))
+    counts = (
+        int(background.n_cells), int(filaments.n_cells),
+        0 if holes is None else int(holes.n_cells),
+    )
     del filaments
     gc.collect()
-    return (*counts, background_actor, filament_actor)
+    return (*counts, background_actor, filament_actor, hole_actor)
 
 
 def _normalize_inputs(
@@ -1122,10 +1209,19 @@ def _write_manifest(path: Path, rows: list[dict]) -> None:
         "filename",
         "step",
         "simulation_time",
+        "simulation_time_s",
         "iso_level",
         "iso_fraction",
         "P_min",
         "P_max",
+        "pressure_quantity",
+        "pressure_units",
+        "pbar_Pa",
+        "negative_iso_level",
+        "hole_cells",
+        "grid_path",
+        "grid_provenance_confirmed",
+        "grid_numerical_checks_passed",
         "heatflux_par_e_min",
         "heatflux_par_e_max",
         "color_field",
@@ -1163,6 +1259,10 @@ def render_filaments(
     continue_on_error: bool = True,
     window_size: tuple[int, int] = (1200, 700),
     grid_output: str | Path | None = None,
+    pressure_quantity: str = "P",
+    iso_kpa: float | None = None,
+    grid_path: str | Path | None = None,
+    grid_confirmed: bool = False,
 ) -> dict[str, list[Path]]:
     """Render filament images for one or more ELMO ADIOS runs.
 
@@ -1179,8 +1279,9 @@ def render_filaments(
         Python-style timestep range.  ``step_stop=None`` uses all available
         steps, and the stop value is exclusive.
     iso_fraction
-        Positive pressure-isosurface level as a fraction of ``max(P)`` at each
-        timestep.  The default is 0.50.
+        Pressure-isosurface level as a fraction of the way from ``min(P)`` to
+        ``max(P)``.  The default is 0.50.  The resulting level may be negative
+        for signed pressure fields.
     iso_value
         Absolute pressure-isosurface value.  Set this instead of
         ``iso_fraction`` to keep the level fixed across timesteps.
@@ -1214,6 +1315,18 @@ def render_filaments(
         mesh.  The mesh is exported once per run after the first successful
         timestep; if omitted, it is written as ``background.vtk`` below the
         run output directory.
+    pressure_quantity
+        ``P`` retains the saved perturbation, including its evolving mean.
+        ``fluctuation`` contours ``P - mean_z(P)`` at both positive and negative
+        levels. ``total`` contours ``P0 + P``. The latter two validate grid pairing.
+    iso_kpa
+        Positive absolute threshold in kPa, converted using this run's Bbar.
+        Selects physical pressure units and supersedes the default iso_fraction.
+    grid_path
+        Optional matching grid.bp path, instead of the grid below each run.
+    grid_confirmed
+        Explicit confirmation that this grid was the simulation input. Still
+        checks shapes and topology; records numerical differences separately.
 
     Returns
     -------
@@ -1227,8 +1340,19 @@ def render_filaments(
         raise ValueError("step_stride must be positive")
     if trailing_steps < 0:
         raise ValueError("trailing_steps must be non-negative")
-    if (iso_fraction is None) == (iso_value is None):
+    if pressure_quantity not in {"P", "fluctuation", "total"}:
+        raise ValueError("pressure_quantity must be P, fluctuation, or total")
+    if iso_kpa is not None:
+        if iso_value is not None or iso_range is not None:
+            raise ValueError("iso_kpa cannot be combined with iso_value or iso_range")
+        if not np.isfinite(iso_kpa) or iso_kpa <= 0.0:
+            raise ValueError("iso_kpa must be finite and positive")
+        iso_fraction = None
+    if iso_kpa is None and (iso_fraction is None) == (iso_value is None):
         raise ValueError("Set exactly one of iso_fraction or iso_value")
+    if pressure_quantity == "fluctuation" and iso_kpa is None:
+        if iso_value is None or not np.isfinite(iso_value) or iso_value <= 0.0:
+            raise ValueError("Signed fluctuation surfaces require a positive absolute threshold")
     if iso_fraction is not None and not 0.0 < iso_fraction <= 1.0:
         raise ValueError("iso_fraction must be in the interval (0, 1]")
     if not 0.0 < color_percentile <= 100.0:
@@ -1248,9 +1372,58 @@ def render_filaments(
 
     for run_name, run_dir in runs:
         print(f"Loading {run_name}: {run_dir}", flush=True)
-        data = _RunData.load(run_dir)
+        data = _RunData.load(run_dir, grid_path)
+        p0 = None
+        pbar_pa = None
+        valid_xy = None
+        time_scale = None
+        grid_audit = None
+        scientific_pressure = (
+            pressure_quantity != "P" or iso_kpa is not None
+            or color_field in {"p_fluct", "p_fluct_kpa", "p_total_kpa"}
+        )
+        try:
+            if scientific_pressure:
+                with DiagnosticRun(
+                    run_dir, data.grid_path, grid_confirmed=grid_confirmed
+                ) as diagnostics:
+                    diagnostics.require_geometry()
+                    grid_audit = diagnostics.audit
+                    if not diagnostics.geometry_verified:
+                        print(
+                            "  Using the confirmed input grid; numerical differences "
+                            "under assumed model conversions are recorded in grid_audit.json",
+                            flush=True,
+                        )
+                    p0 = diagnostics.p0
+                    pbar_pa = diagnostics.pbar_pa
+                    valid_xy = diagnostics.valid
+                    time_scale = diagnostics.tbar or None
+                    if diagnostics.nz != data.nz:
+                        raise ValueError("Renderer requires unique toroidal samples without an extra closing plane")
+                    mxg = diagnostics.mxg
+                data.bout_blocks = [
+                    (name, ix[(ix >= mxg) & (ix < data.nx - mxg)], jy)
+                    for name, ix, jy in data.bout_blocks
+                ]
+                data.visit_mappings = _make_visit_mappings(data, mxg)
+        except Exception:
+            data.close()
+            raise
+        pressure_factor = pbar_pa / 1000.0 if iso_kpa is not None else 1.0
         run_output = output_dir / run_name
         run_output.mkdir(parents=True, exist_ok=True)
+        if scientific_pressure and not overwrite and any(run_output.glob("*.png")):
+            data.close()
+            raise FileExistsError(
+                f"Scientific frames already exist in {run_output}; "
+                "choose a new output directory or use --overwrite"
+            )
+        if grid_audit is not None:
+            (run_output / "grid_audit.json").write_text(
+                json.dumps(grid_audit, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
         try:
             if write_grid_vtk or write_merged_grid_vtk:
                 _, grid_field, _, _ = data.read_step(step_start, color_field)
@@ -1299,12 +1472,15 @@ def render_filaments(
                     f"({data.nsteps}), got {range_stop}"
                 )
             fixed_pressure_range = _pressure_range_over_steps(
-                data, range_start, range_stop, color_field
+                data, range_start, range_stop, color_field,
+                pressure_quantity, p0, pressure_factor,
+                valid_xy,
             )
 
         plotter = pv.Plotter(off_screen=True, window_size=window_size)
         background_actor = None
         filament_actor = None
+        hole_actor = None
 
         print(
             f"  {data.nsteps} available steps; rendering "
@@ -1318,10 +1494,21 @@ def render_filaments(
                 filename="",
                 step=step,
                 simulation_time="",
+                simulation_time_s="",
                 iso_level="",
                 iso_fraction="" if iso_fraction is None else iso_fraction,
                 P_min="",
                 P_max="",
+                pressure_quantity=pressure_quantity,
+                pressure_units="kPa" if iso_kpa is not None else "code",
+                pbar_Pa="" if pbar_pa is None else pbar_pa,
+                negative_iso_level="",
+                hole_cells="",
+                grid_path=str(data.grid_path),
+                grid_provenance_confirmed=grid_confirmed,
+                grid_numerical_checks_passed=(
+                    "" if grid_audit is None else grid_audit["geometry_verified"]
+                ),
                 heatflux_par_e_min="",
                 heatflux_par_e_max="",
                 color_field=color_field,
@@ -1347,6 +1534,9 @@ def render_filaments(
                     pressure, color, heatflux, simulation_time = data.read_step(
                         step, color_field
                     )
+                    pressure = _selected_pressure(
+                        pressure, pressure_quantity, p0, pressure_factor
+                    )
                     if simulation_time is not None and "{time" in filename_pattern:
                         filename = filename_pattern.format(
                             run=run_name, step=step, time=simulation_time
@@ -1357,20 +1547,21 @@ def render_filaments(
                     pressure_min, pressure_max = (
                         fixed_pressure_range
                         if fixed_pressure_range is not None
-                        else _pressure_range(pressure)
+                        else _pressure_range(
+                            pressure if valid_xy is None else pressure[valid_xy]
+                        )
                     )
                     level = (
-                        float(iso_value)
+                        float(iso_kpa)
+                        if iso_kpa is not None
+                        else float(iso_value)
                         if iso_value is not None
                         else pressure_min
                         + float(iso_fraction) * (pressure_max - pressure_min)
                     )
-                    if level <= 0.0:
-                        raise ValueError(
-                            f"The selected positive P isovalue is {level:.12e}"
-                        )
                     limits = color_limits or _automatic_color_limits(
-                        color, color_field, color_percentile
+                        color if valid_xy is None else color[valid_xy],
+                        color_field, color_percentile,
                     )
                     if background_mesh is None:
                         background_mesh = _build_background_mesh(
@@ -1389,8 +1580,10 @@ def render_filaments(
                     (
                         background_cells,
                         filament_cells,
+                        hole_cells,
                         background_actor,
                         filament_actor,
+                        hole_actor,
                     ) = _render_frame(
                         data,
                         background_mesh,
@@ -1405,10 +1598,18 @@ def render_filaments(
                         plotter,
                         background_actor,
                         filament_actor,
+                        hole_actor,
+                        pressure_quantity == "fluctuation",
+                        f"p_fluct ({'kPa' if iso_kpa is not None else 'code'})",
+                        time_scale,
                     )
                     row.update(
                         simulation_time=(
                             "" if simulation_time is None else simulation_time
+                        ),
+                        simulation_time_s=(
+                            "" if simulation_time is None or time_scale is None
+                            else simulation_time * time_scale
                         ),
                         iso_level=level,
                         P_min=pressure_min,
@@ -1419,6 +1620,10 @@ def render_filaments(
                         color_max=limits[1],
                         background_cells=background_cells,
                         filament_cells=filament_cells,
+                        hole_cells=hole_cells,
+                        negative_iso_level=(
+                            -level if pressure_quantity == "fluctuation" else ""
+                        ),
                         status="rendered",
                     )
                     images.append(output_path)
@@ -1476,10 +1681,26 @@ def _main() -> None:
     )
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--start", type=int, default=500)
-    parser.add_argument("--stop", type=int)
+    parser.add_argument(
+        "--stop",
+        type=int,
+        help="Exclusive stop; if omitted, skips the final --trailing-steps (default: 10)",
+    )
     parser.add_argument("--stride", type=int, default=10)
-    parser.add_argument("--iso-fraction", type=float, default=0.50)
-    parser.add_argument("--iso-value", type=float)
+    thresholds = parser.add_mutually_exclusive_group()
+    thresholds.add_argument("--iso-fraction", type=float, default=0.50)
+    thresholds.add_argument("--iso-value", type=float)
+    thresholds.add_argument("--iso-kpa", type=float, help="Common absolute physical pressure threshold in kPa")
+    parser.add_argument(
+        "--pressure-quantity", choices=["P", "fluctuation", "total"], default="P",
+        help="Saved P, nonaxisymmetric P-mean_z(P), or P0+P (default: P)",
+    )
+    parser.add_argument("--grid-path", type=Path, help="Matching grid.bp path")
+    parser.add_argument(
+        "--grid-confirmed", action="store_true",
+        help="Use a confirmed original input grid after shape/topology checks; "
+        "record numerical comparisons separately",
+    )
     parser.add_argument(
         "--iso-range",
         type=int,
@@ -1494,6 +1715,10 @@ def _main() -> None:
         help="Final timesteps to skip when --stop is omitted (default: 10)",
     )
     parser.add_argument("--color-field", default="phi")
+    parser.add_argument(
+        "--color-limits", type=float, nargs=2, metavar=("MIN", "MAX"),
+        help="Fixed background color range, in the selected field's units",
+    )
     parser.add_argument(
         "--write-grid-vtk",
         action="store_true",
@@ -1521,6 +1746,11 @@ def _main() -> None:
         iso_range=None if args.iso_range is None else tuple(args.iso_range),
         trailing_steps=args.trailing_steps,
         color_field=args.color_field,
+        color_limits=None if args.color_limits is None else tuple(args.color_limits),
+        pressure_quantity=args.pressure_quantity,
+        iso_kpa=args.iso_kpa,
+        grid_path=args.grid_path,
+        grid_confirmed=args.grid_confirmed,
         write_grid_vtk=args.write_grid_vtk,
         write_merged_grid_vtk=args.write_merged_grid_vtk,
         overwrite=args.overwrite,
